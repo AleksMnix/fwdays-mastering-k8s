@@ -10,95 +10,9 @@ Deploy a custom nginx deployment with 3 replicas and troubleshoot any issues tha
 sudo kubebuilder/bin/kubectl create deployment nginx --image=nginx --replicas=3
 ```
 
-## Troubleshooting Journey
-
-### Issue 1: Pods Stuck in Pending State
-
-**Symptom:**
-```bash
-$ sudo kubebuilder/bin/kubectl get pods -o wide
-NAME                    READY   STATUS    RESTARTS   AGE   IP       NODE     NOMINATED NODE   READINESS GATES
-nginx-bf5d5cf98-4rvgd   0/1     Pending   0          11s   <none>   <none>   <none>           <none>
-nginx-bf5d5cf98-mjp5w   0/1     Pending   0          11s   <none>   <none>   <none>           <none>
-nginx-bf5d5cf98-xgfk8   0/1     Pending   0          11s   <none>   <none>   <none>           <none>
-```
-
-**Investigation:**
-The pods were created successfully but stuck in `Pending` state with no node assignment (`NODE` column shows `<none>`).
-
-**Root Cause Analysis:**
-
-#### 1. No Node Registered
-
-```bash
-$ sudo kubebuilder/bin/kubectl get nodes
-No resources found
-```
-
-The cluster had no worker nodes registered. This was because **kubelet was not running**.
-
-**Why kubelet wasn't running:**
-- Kubelet had exited after a previous `sh setup.sh start` command was canceled
-- The `start_static` command was run without ensuring all prerequisites were met
-- Containerd wasn't running, which caused kubelet to fail with:
-  ```
-  dial unix /run/containerd/containerd.sock: connect: no such file or directory
-  ```
-
-#### 2. Containerd Not Running
-
-Kubelet requires a container runtime (containerd) to manage containers. When kubelet tried to start, it failed because it couldn't connect to containerd's socket.
-
-**Error in logs:**
-```
-W1006 13:02:44.247371   53567 logging.go:59] [core] [Channel #1 SubChannel #2] grpc: addrConn.createTransport failed to connect to {Addr: "/run/containerd/containerd.sock", ServerName: "%2Frun%2Fcontainerd%2Fcontainerd.sock", }. Err: connection error: desc = "transport: Error while dialing: dial unix /run/containerd/containerd.sock: connect: no such file or directory"
-E1006 13:02:44.247992   53567 run.go:74] "command failed" err="failed to run Kubelet: validate service connection: validate CRI v1 runtime API for endpoint \"unix:///run/containerd/containerd.sock\": rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing: dial unix /run/containerd/containerd.sock: connect: no such file or directory\""
-```
-
-### Fix 1: Start Containerd
-
-```bash
-sudo PATH=$PATH:/opt/cni/bin:/usr/sbin /opt/cni/bin/containerd -c /etc/containerd/config.toml > /tmp/containerd.log 2>&1 &
-```
-
-**Verification:**
-```bash
-$ ps aux | grep "[c]ontainerd -c"
-root       54504  0.0  0.0  16384  6272 ?        S<   13:04   0:00 sudo PATH=... /opt/cni/bin/containerd -c /etc/containerd/config.toml
-```
-
-### Fix 2: Start Kubelet
-
-```bash
-HOST_IP=$(hostname -I | awk '{print $1}')
-sudo PATH=$PATH:/opt/cni/bin:/usr/sbin kubebuilder/bin/kubelet \
-    --kubeconfig=/var/lib/kubelet/kubeconfig \
-    --config=/var/lib/kubelet/config.yaml \
-    --root-dir=/var/lib/kubelet \
-    --cert-dir=/var/lib/kubelet/pki \
-    --tls-cert-file=/var/lib/kubelet/pki/kubelet.crt \
-    --tls-private-key-file=/var/lib/kubelet/pki/kubelet.key \
-    --hostname-override=$(hostname) \
-    --pod-infra-container-image=registry.k8s.io/pause:3.10 \
-    --node-ip=$HOST_IP \
-    --cloud-provider=external \
-    --cgroup-driver=cgroupfs \
-    --max-pods=10 \
-    --v=1 > /tmp/kubelet.log 2>&1 &
-```
-
-**Verification:**
-```bash
-$ sudo kubebuilder/bin/kubectl get nodes
-NAME                STATUS   ROLES    AGE   VERSION
-codespaces-87f0bf   Ready    <none>   29s   v1.30.0
-```
-
-✅ **Success!** The node is now registered and in `Ready` state.
-
 ---
 
-### Issue 2: Pods Still Pending Despite Node Being Ready
+## Troubleshooting: Pods Still Pending Despite Node Being Ready
 
 **Symptom:**
 Even after the node was registered and showing as `Ready`, the nginx pods remained in `Pending` state:
@@ -188,47 +102,123 @@ nginx   3/3     3            3           3m
 
 ---
 
-## Summary: Root Causes and Fixes
+---
 
-| Issue | Root Cause | Fix | Verification |
-|-------|-----------|-----|--------------|
-| **Pods Pending (No Node)** | Kubelet not running because containerd was not running | Start containerd, then start kubelet | `kubectl get nodes` shows node as Ready |
-| **Containerd Socket Missing** | Containerd process was never started | `sudo /opt/cni/bin/containerd -c /etc/containerd/config.toml &` | `ps aux \| grep containerd` shows process |
-| **Pods Pending (Node Exists)** | Node had taint `node.cloudprovider.kubernetes.io/uninitialized:NoSchedule` | Remove taint: `kubectl taint nodes <node-name> node.cloudprovider.kubernetes.io/uninitialized:NoSchedule-` | Pods transition to ContainerCreating/Running |
+## Summary
+
+### Root Cause
+Node had taint `node.cloudprovider.kubernetes.io/uninitialized:NoSchedule` that prevented pod scheduling.
+
+### Fix
+Remove the taint manually:
+```bash
+kubectl taint nodes <node-name> node.cloudprovider.kubernetes.io/uninitialized:NoSchedule-
+```
+
+### Verification
+Pods transition to `ContainerCreating` → `Running`
 
 ---
 
 ## Key Learnings
 
-1. **Container Runtime Dependency**: Kubelet requires a running container runtime (containerd, CRI-O, etc.) before it can start. Always verify the runtime is running.
+### 1. Node Taints and Pod Scheduling
+When using `--cloud-provider=external`, Kubernetes automatically adds the `node.cloudprovider.kubernetes.io/uninitialized:NoSchedule` taint to prevent pod scheduling until a cloud controller initializes the node. Without a real cloud controller manager, this taint must be **manually removed**.
 
-2. **Node Taints**: When using `--cloud-provider=external`, Kubernetes automatically adds the `node.cloudprovider.kubernetes.io/uninitialized` taint. Without a cloud controller manager, this must be manually removed.
+### 2. Debugging Workflow for Pending Pods
 
-3. **Debugging Workflow**:
-   - Check pod status: `kubectl get pods -o wide`
-   - Check pod events: `kubectl describe pod <pod-name>`
-   - Check node status: `kubectl get nodes`
-   - Check node details: `kubectl describe node <node-name>`
-   - Check component logs: `tail -f /tmp/kubelet.log`
+**Step 1:** Check pod status
+```bash
+kubectl get pods -o wide
+```
+Look for: `STATUS`, `NODE` assignment, `IP` address
 
-4. **Startup Order Matters**:
-   - containerd → kubelet → node registration → pod scheduling
-   - Each step depends on the previous one
+**Step 2:** Describe the pod to see events
+```bash
+kubectl describe pod <pod-name>
+```
+Look for: Scheduling events, warnings, error messages
 
-5. **Static Pods**: Kubelet can manage static pods from `/etc/kubernetes/manifests/` but still needs containerd to run them.
+**Step 3:** Check node availability and status
+```bash
+kubectl get nodes
+```
+Verify: Node is present and in `Ready` state
+
+**Step 4:** Inspect node for taints and conditions
+```bash
+kubectl describe node <node-name> | grep -A 5 "Taints:"
+```
+Look for: Any `NoSchedule` or `NoExecute` taints
+
+### 3. Common Reasons for Pending Pods
+
+| Reason | How to Identify | Solution |
+|--------|----------------|----------|
+| **No nodes available** | `kubectl get nodes` returns no nodes | Start/register kubelet |
+| **Node taints** | `kubectl describe node` shows taints | Remove inappropriate taints |
+| **Resource constraints** | Pod events show "Insufficient cpu/memory" | Add resources or scale nodes |
+| **Node selector mismatch** | Pod has nodeSelector that no node matches | Fix labels or nodeSelector |
+| **PVC issues** | Pod events show volume/PVC errors | Fix PersistentVolumeClaim |
+
+### 4. Understanding Taints and Tolerations
+
+**Taints** prevent pods from being scheduled on nodes unless the pods have matching **tolerations**.
+
+**Common taints:**
+- `node.cloudprovider.kubernetes.io/uninitialized:NoSchedule` - Cloud provider not initialized
+- `node.kubernetes.io/not-ready:NoSchedule` - Node not ready
+- `node.kubernetes.io/unreachable:NoSchedule` - Node unreachable
+- `node.kubernetes.io/disk-pressure:NoSchedule` - Disk pressure on node
+
+**View node taints:**
+```bash
+kubectl describe node <node-name> | grep Taints
+```
+
+**Remove a taint:**
+```bash
+kubectl taint nodes <node-name> <taint-key>:<effect>-
+# Example: kubectl taint nodes worker-1 node.cloudprovider.kubernetes.io/uninitialized:NoSchedule-
+```
 
 ---
 
-## Cleanup
+## Quick Reference
 
-To clean up the nginx deployment:
+### Troubleshooting Commands
 
+```bash
+# Check deployment status
+kubectl get deployments
+
+# Check pod status with details
+kubectl get pods -o wide
+
+# Get detailed pod information
+kubectl describe pod <pod-name>
+
+# Check pod events only
+kubectl get events --field-selector involvedObject.name=<pod-name>
+
+# Check node status
+kubectl get nodes
+
+# Check node details and taints
+kubectl describe node <node-name>
+
+# Check scheduler logs (if running)
+kubectl logs -n kube-system <scheduler-pod-name>
+```
+
+### Cleanup
+
+Clean up the nginx deployment:
 ```bash
 sudo kubebuilder/bin/kubectl delete deployment nginx
 ```
 
-To clean up the entire cluster:
-
+Clean up the entire cluster:
 ```bash
 sh setup.sh cleanup
 ```
