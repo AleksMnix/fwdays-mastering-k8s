@@ -92,7 +92,7 @@ download_components() {
 generate_manifests() {
     HOST_IP=$1
     echo "Generating Kubernetes component manifests..."
-    
+
     # Generate manifests with HOST_IP substitution
     # This reads template manifests from k8s-manifests/ directory,
     # replaces HOST_IP placeholder with actual IP, and writes to
@@ -374,6 +374,44 @@ start() {
     sudo kubebuilder/bin/kubectl get --raw='/readyz?verbose'
 }
 
+start_static() {
+    echo "Transitioning control plane to static pods..."
+    
+    if ! check_running; then
+        echo "Kubernetes components are not running. Please run 'sh setup.sh start' first."
+        return 1
+    fi
+    
+    HOST_IP=$(hostname -I | awk '{print $1}')
+    
+    # Regenerate manifests to ensure they're up to date
+    generate_manifests "$HOST_IP"
+    
+    echo "Stopping binary-based control plane components..."
+    echo "Note: etcd, containerd, and kubelet will continue running"
+    
+    # Stop only the control plane components (not etcd, containerd, or kubelet)
+    stop_process "kube-controller-manager"
+    stop_process "kube-scheduler"
+    stop_process "kube-apiserver"
+    
+    echo "Waiting for kubelet to detect and start static pods..."
+    echo "This may take 20-30 seconds..."
+    sleep 25
+    
+    echo "Checking static pod status..."
+    sudo kubebuilder/bin/kubectl get pods -n kube-system -o wide
+    
+    echo ""
+    echo "Verifying control plane health..."
+    sudo kubebuilder/bin/kubectl get nodes
+    sudo kubebuilder/bin/kubectl get componentstatuses 2>/dev/null || true
+    
+    echo ""
+    echo "Static pod manifests are located in: /etc/kubernetes/manifests/"
+    echo "Kubelet will automatically manage these pods."
+}
+
 stop() {
     echo "Stopping Kubernetes components..."
     stop_process "cloud-controller-manager"
@@ -422,6 +460,9 @@ case "${1:-}" in
     start)
         start
         ;;
+    start-static)
+        start_static
+        ;;
     stop)
         stop
         ;;
@@ -429,7 +470,13 @@ case "${1:-}" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {start|stop|cleanup}"
+        echo "Usage: $0 {start|start-static|stop|cleanup}"
+        echo ""
+        echo "Commands:"
+        echo "  start         - Start Kubernetes with binary-based control plane"
+        echo "  start-static  - Transition control plane to kubelet-managed static pods"
+        echo "  stop          - Stop all Kubernetes components"
+        echo "  cleanup       - Stop and clean up all data"
         exit 1
         ;;
 esac
