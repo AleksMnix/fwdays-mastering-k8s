@@ -92,14 +92,14 @@ download_components() {
 generate_manifests() {
     HOST_IP=$1
     echo "Generating Kubernetes component manifests..."
-
+    
     # Generate manifests with HOST_IP substitution
     # This reads template manifests from k8s-manifests/ directory,
     # replaces HOST_IP placeholder with actual IP, and writes to
     # /etc/kubernetes/manifests/ where kubelet will pick them up as static pods
     for manifest in k8s-manifests/*.yaml; do
         if [ -f "$manifest" ]; then
-            sudo sed "s/HOST_IP/$HOST_IP/g" "$manifest" > "/etc/kubernetes/manifests/$(basename $manifest)"
+            sed "s/HOST_IP/$HOST_IP/g" "$manifest" | sudo tee "/etc/kubernetes/manifests/$(basename $manifest)" > /dev/null
             echo "  Generated: /etc/kubernetes/manifests/$(basename $manifest)"
         fi
     done
@@ -107,10 +107,10 @@ generate_manifests() {
 
 setup_configs() {
     HOST_IP=$1
-    
+
     # Generate certificates and tokens if they don't exist
     sudo mkdir -p /etc/kubernetes/pki
-    
+
     if [ ! -f "/etc/kubernetes/pki/sa.key" ]; then
         sudo openssl genrsa -out /etc/kubernetes/pki/sa.key 2048
         sudo openssl rsa -in /etc/kubernetes/pki/sa.key -pubout -out /etc/kubernetes/pki/sa.pub
