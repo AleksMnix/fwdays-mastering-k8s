@@ -107,24 +107,24 @@ generate_manifests() {
 
 setup_configs() {
     HOST_IP=$1
-
+    
     # Generate certificates and tokens if they don't exist
     sudo mkdir -p /etc/kubernetes/pki
-
+    
     if [ ! -f "/etc/kubernetes/pki/sa.key" ]; then
-        openssl genrsa -out /etc/kubernetes/pki/sa.key 2048
-        openssl rsa -in /etc/kubernetes/pki/sa.key -pubout -out /etc/kubernetes/pki/sa.pub
+        sudo openssl genrsa -out /etc/kubernetes/pki/sa.key 2048
+        sudo openssl rsa -in /etc/kubernetes/pki/sa.key -pubout -out /etc/kubernetes/pki/sa.pub
     fi
 
     if [ ! -f "/etc/kubernetes/pki/token.csv" ]; then
         TOKEN="1234567890"
-        echo "${TOKEN},admin,admin,system:masters" > /etc/kubernetes/pki/token.csv
+        echo "${TOKEN},admin,admin,system:masters" | sudo tee /etc/kubernetes/pki/token.csv > /dev/null
     fi
 
     # Always regenerate and copy CA certificate to ensure it exists
     echo "Generating CA certificate..."
-    openssl genrsa -out /etc/kubernetes/pki/ca.key 2048
-    openssl req -x509 -new -nodes -key /etc/kubernetes/pki/ca.key -subj "/CN=kubelet-ca" -days 365 -out /etc/kubernetes/pki/ca.crt
+    sudo openssl genrsa -out /etc/kubernetes/pki/ca.key 2048
+    sudo openssl req -x509 -new -nodes -key /etc/kubernetes/pki/ca.key -subj "/CN=kubelet-ca" -days 365 -out /etc/kubernetes/pki/ca.crt
     sudo mkdir -p /var/lib/kubelet/pki
     sudo cp /etc/kubernetes/pki/ca.crt /var/lib/kubelet/ca.crt
     sudo cp /etc/kubernetes/pki/ca.crt /var/lib/kubelet/pki/ca.crt
@@ -310,7 +310,7 @@ start() {
     # Set up kubelet kubeconfig
     sudo cp /root/.kube/config /var/lib/kubelet/kubeconfig
     export KUBECONFIG=~/.kube/config
-    cp /etc/kubernetes/pki/sa.pub /etc/kubernetes/pki/ca.crt
+    sudo cp /etc/kubernetes/pki/sa.pub /etc/kubernetes/pki/ca.crt
 
     # Create service account and configmap if they don't exist
     sudo kubebuilder/bin/kubectl create sa default 2>/dev/null || true
