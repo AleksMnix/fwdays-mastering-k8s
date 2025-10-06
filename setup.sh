@@ -89,25 +89,45 @@ download_components() {
     fi
 }
 
+generate_manifests() {
+    HOST_IP=$1
+    echo "Generating Kubernetes component manifests..."
+
+    # Generate manifests with HOST_IP substitution
+    # This reads template manifests from k8s-manifests/ directory,
+    # replaces HOST_IP placeholder with actual IP, and writes to
+    # /etc/kubernetes/manifests/ where kubelet will pick them up as static pods
+    for manifest in k8s-manifests/*.yaml; do
+        if [ -f "$manifest" ]; then
+            sudo sed "s/HOST_IP/$HOST_IP/g" "$manifest" > "/etc/kubernetes/manifests/$(basename $manifest)"
+            echo "  Generated: /etc/kubernetes/manifests/$(basename $manifest)"
+        fi
+    done
+}
+
 setup_configs() {
+    HOST_IP=$1
+
     # Generate certificates and tokens if they don't exist
-    if [ ! -f "/tmp/sa.key" ]; then
-        openssl genrsa -out /tmp/sa.key 2048
-        openssl rsa -in /tmp/sa.key -pubout -out /tmp/sa.pub
+    sudo mkdir -p /etc/kubernetes/pki
+
+    if [ ! -f "/etc/kubernetes/pki/sa.key" ]; then
+        openssl genrsa -out /etc/kubernetes/pki/sa.key 2048
+        openssl rsa -in /etc/kubernetes/pki/sa.key -pubout -out /etc/kubernetes/pki/sa.pub
     fi
 
-    if [ ! -f "/tmp/token.csv" ]; then
+    if [ ! -f "/etc/kubernetes/pki/token.csv" ]; then
         TOKEN="1234567890"
-        echo "${TOKEN},admin,admin,system:masters" > /tmp/token.csv
+        echo "${TOKEN},admin,admin,system:masters" > /etc/kubernetes/pki/token.csv
     fi
 
     # Always regenerate and copy CA certificate to ensure it exists
     echo "Generating CA certificate..."
-    openssl genrsa -out /tmp/ca.key 2048
-    openssl req -x509 -new -nodes -key /tmp/ca.key -subj "/CN=kubelet-ca" -days 365 -out /tmp/ca.crt
+    openssl genrsa -out /etc/kubernetes/pki/ca.key 2048
+    openssl req -x509 -new -nodes -key /etc/kubernetes/pki/ca.key -subj "/CN=kubelet-ca" -days 365 -out /etc/kubernetes/pki/ca.crt
     sudo mkdir -p /var/lib/kubelet/pki
-    sudo cp /tmp/ca.crt /var/lib/kubelet/ca.crt
-    sudo cp /tmp/ca.crt /var/lib/kubelet/pki/ca.crt
+    sudo cp /etc/kubernetes/pki/ca.crt /var/lib/kubelet/ca.crt
+    sudo cp /etc/kubernetes/pki/ca.crt /var/lib/kubelet/pki/ca.crt
 
     # Set up kubeconfig if not already configured
     if ! sudo kubebuilder/bin/kubectl config current-context | grep -q "test-context"; then
@@ -230,7 +250,10 @@ start() {
     download_components
 
     # Setup configurations
-    setup_configs
+    setup_configs "$HOST_IP"
+
+    # Generate manifests for static pods
+    generate_manifests "$HOST_IP"
 
     # Start components if not running
     if ! is_running "etcd"; then
@@ -256,7 +279,7 @@ start() {
             --secure-port=6443 \
             --advertise-address=$HOST_IP \
             --authorization-mode=AlwaysAllow \
-            --token-auth-file=/tmp/token.csv \
+            --token-auth-file=/etc/kubernetes/pki/token.csv \
             --enable-priority-and-fairness=false \
             --allow-privileged=true \
             --profiling=false \
@@ -265,8 +288,8 @@ start() {
             --v=0 \
             --cloud-provider=external \
             --service-account-issuer=https://kubernetes.default.svc.cluster.local \
-            --service-account-key-file=/tmp/sa.pub \
-            --service-account-signing-key-file=/tmp/sa.key &
+            --service-account-key-file=/etc/kubernetes/pki/sa.pub \
+            --service-account-signing-key-file=/etc/kubernetes/pki/sa.key &
     fi
 
     if ! is_running "containerd"; then
@@ -287,11 +310,11 @@ start() {
     # Set up kubelet kubeconfig
     sudo cp /root/.kube/config /var/lib/kubelet/kubeconfig
     export KUBECONFIG=~/.kube/config
-    cp /tmp/sa.pub /tmp/ca.crt
+    cp /etc/kubernetes/pki/sa.pub /etc/kubernetes/pki/ca.crt
 
     # Create service account and configmap if they don't exist
     sudo kubebuilder/bin/kubectl create sa default 2>/dev/null || true
-    sudo kubebuilder/bin/kubectl create configmap kube-root-ca.crt --from-file=ca.crt=/tmp/ca.crt -n default 2>/dev/null || true
+    sudo kubebuilder/bin/kubectl create configmap kube-root-ca.crt --from-file=ca.crt=/etc/kubernetes/pki/ca.crt -n default 2>/dev/null || true
 
 
     if ! is_running "kubelet"; then
@@ -336,7 +359,7 @@ start() {
             --service-cluster-ip-range=10.0.0.0/24 \
             --cluster-name=kubernetes \
             --root-ca-file=/var/lib/kubelet/ca.crt \
-            --service-account-private-key-file=/tmp/sa.key \
+            --service-account-private-key-file=/etc/kubernetes/pki/sa.key \
             --use-service-account-credentials=true \
             --v=2 &
     fi
@@ -390,7 +413,7 @@ cleanup() {
     # Clean up other directories
     sudo rm -rf ./etcd
     sudo rm -rf /run/containerd/*
-    sudo rm -f /tmp/sa.key /tmp/sa.pub /tmp/token.csv /tmp/ca.key /tmp/ca.crt
+    sudo rm -rf /etc/kubernetes/pki/*
 
     echo "Cleanup complete"
 }

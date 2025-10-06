@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: kube-system
+  labels:
+    component: kube-apiserver
+    tier: control-plane
+spec:
+  hostNetwork: true
+  priorityClassName: system-cluster-critical
+  containers:
+  - name: kube-apiserver
+    image: registry.k8s.io/kube-apiserver:v1.30.0
+    command:
+    - kube-apiserver
+    - --etcd-servers=http://HOST_IP:2379
+    - --service-cluster-ip-range=10.0.0.0/24
+    - --bind-address=0.0.0.0
+    - --secure-port=6443
+    - --advertise-address=HOST_IP
+    - --authorization-mode=AlwaysAllow
+    - --token-auth-file=/etc/kubernetes/pki/token.csv
+    - --enable-priority-and-fairness=false
+    - --allow-privileged=true
+    - --profiling=false
+    - --storage-backend=etcd3
+    - --storage-media-type=application/json
+    - --cloud-provider=external
+    - --service-account-issuer=https://kubernetes.default.svc.cluster.local
+    - --service-account-key-file=/etc/kubernetes/pki/sa.pub
+    - --service-account-signing-key-file=/etc/kubernetes/pki/sa.key
+    - --v=2
+    volumeMounts:
+    - name: k8s-certs
+      mountPath: /etc/kubernetes/pki
+      readOnly: true
+    livenessProbe:
+      httpGet:
+        path: /livez
+        port: 6443
+        scheme: HTTPS
+      initialDelaySeconds: 15
+      timeoutSeconds: 15
+      periodSeconds: 10
+      failureThreshold: 8
+    readinessProbe:
+      httpGet:
+        path: /readyz
+        port: 6443
+        scheme: HTTPS
+      initialDelaySeconds: 10
+      timeoutSeconds: 15
+      periodSeconds: 1
+      failureThreshold: 3
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+  volumes:
+  - name: k8s-certs
+    hostPath:
+      path: /etc/kubernetes/pki
+      type: DirectoryOrCreate
+
