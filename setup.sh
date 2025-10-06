@@ -89,25 +89,45 @@ download_components() {
     fi
 }
 
+generate_manifests() {
+    HOST_IP=$1
+    echo "Generating Kubernetes component manifests..."
+
+    # Generate manifests with HOST_IP substitution
+    # This reads template manifests from k8s-manifests/ directory,
+    # replaces HOST_IP placeholder with actual IP, and writes to
+    # /etc/kubernetes/manifests/ where kubelet will pick them up as static pods
+    for manifest in k8s-manifests/*.yaml; do
+        if [ -f "$manifest" ]; then
+            sed "s/HOST_IP/$HOST_IP/g" "$manifest" | sudo tee "/etc/kubernetes/manifests/$(basename $manifest)" > /dev/null
+            echo "  Generated: /etc/kubernetes/manifests/$(basename $manifest)"
+        fi
+    done
+}
+
 setup_configs() {
+    HOST_IP=$1
+
     # Generate certificates and tokens if they don't exist
-    if [ ! -f "/tmp/sa.key" ]; then
-        openssl genrsa -out /tmp/sa.key 2048
-        openssl rsa -in /tmp/sa.key -pubout -out /tmp/sa.pub
+    sudo mkdir -p /etc/kubernetes/pki
+
+    if [ ! -f "/etc/kubernetes/pki/sa.key" ]; then
+        sudo openssl genrsa -out /etc/kubernetes/pki/sa.key 2048
+        sudo openssl rsa -in /etc/kubernetes/pki/sa.key -pubout -out /etc/kubernetes/pki/sa.pub
     fi
 
-    if [ ! -f "/tmp/token.csv" ]; then
+    if [ ! -f "/etc/kubernetes/pki/token.csv" ]; then
         TOKEN="1234567890"
-        echo "${TOKEN},admin,admin,system:masters" > /tmp/token.csv
+        echo "${TOKEN},admin,admin,system:masters" | sudo tee /etc/kubernetes/pki/token.csv > /dev/null
     fi
 
     # Always regenerate and copy CA certificate to ensure it exists
     echo "Generating CA certificate..."
-    openssl genrsa -out /tmp/ca.key 2048
-    openssl req -x509 -new -nodes -key /tmp/ca.key -subj "/CN=kubelet-ca" -days 365 -out /tmp/ca.crt
+    sudo openssl genrsa -out /etc/kubernetes/pki/ca.key 2048
+    sudo openssl req -x509 -new -nodes -key /etc/kubernetes/pki/ca.key -subj "/CN=kubelet-ca" -days 365 -out /etc/kubernetes/pki/ca.crt
     sudo mkdir -p /var/lib/kubelet/pki
-    sudo cp /tmp/ca.crt /var/lib/kubelet/ca.crt
-    sudo cp /tmp/ca.crt /var/lib/kubelet/pki/ca.crt
+    sudo cp /etc/kubernetes/pki/ca.crt /var/lib/kubelet/ca.crt
+    sudo cp /etc/kubernetes/pki/ca.crt /var/lib/kubelet/pki/ca.crt
 
     # Set up kubeconfig if not already configured
     if ! sudo kubebuilder/bin/kubectl config current-context | grep -q "test-context"; then
@@ -230,7 +250,10 @@ start() {
     download_components
 
     # Setup configurations
-    setup_configs
+    setup_configs "$HOST_IP"
+
+    # Generate manifests for static pods
+    generate_manifests "$HOST_IP"
 
     # Start components if not running
     if ! is_running "etcd"; then
@@ -256,7 +279,7 @@ start() {
             --secure-port=6443 \
             --advertise-address=$HOST_IP \
             --authorization-mode=AlwaysAllow \
-            --token-auth-file=/tmp/token.csv \
+            --token-auth-file=/etc/kubernetes/pki/token.csv \
             --enable-priority-and-fairness=false \
             --allow-privileged=true \
             --profiling=false \
@@ -265,8 +288,8 @@ start() {
             --v=0 \
             --cloud-provider=external \
             --service-account-issuer=https://kubernetes.default.svc.cluster.local \
-            --service-account-key-file=/tmp/sa.pub \
-            --service-account-signing-key-file=/tmp/sa.key &
+            --service-account-key-file=/etc/kubernetes/pki/sa.pub \
+            --service-account-signing-key-file=/etc/kubernetes/pki/sa.key &
     fi
 
     if ! is_running "containerd"; then
@@ -287,12 +310,18 @@ start() {
     # Set up kubelet kubeconfig
     sudo cp /root/.kube/config /var/lib/kubelet/kubeconfig
     export KUBECONFIG=~/.kube/config
-    cp /tmp/sa.pub /tmp/ca.crt
+    sudo cp /etc/kubernetes/pki/sa.pub /etc/kubernetes/pki/ca.crt
 
     # Create service account and configmap if they don't exist
     sudo kubebuilder/bin/kubectl create sa default 2>/dev/null || true
-    sudo kubebuilder/bin/kubectl create configmap kube-root-ca.crt --from-file=ca.crt=/tmp/ca.crt -n default 2>/dev/null || true
+    sudo kubebuilder/bin/kubectl create configmap kube-root-ca.crt --from-file=ca.crt=/etc/kubernetes/pki/ca.crt -n default 2>/dev/null || true
 
+
+    # Wait for containerd to be ready before starting kubelet
+    if is_running "containerd"; then
+        echo "Waiting for containerd to be fully ready..."
+        sleep 3
+    fi
 
     if ! is_running "kubelet"; then
         echo "Starting kubelet..."
@@ -336,7 +365,7 @@ start() {
             --service-cluster-ip-range=10.0.0.0/24 \
             --cluster-name=kubernetes \
             --root-ca-file=/var/lib/kubelet/ca.crt \
-            --service-account-private-key-file=/tmp/sa.key \
+            --service-account-private-key-file=/etc/kubernetes/pki/sa.key \
             --use-service-account-credentials=true \
             --v=2 &
     fi
@@ -349,6 +378,93 @@ start() {
     sudo kubebuilder/bin/kubectl get all -A
     sudo kubebuilder/bin/kubectl get componentstatuses || true
     sudo kubebuilder/bin/kubectl get --raw='/readyz?verbose'
+}
+
+start_static() {
+    echo "Transitioning control plane to static pods..."
+
+    # Check if essential components are running (not cloud-controller-manager or kubelet yet)
+    if ! is_running "etcd" || ! is_running "kube-apiserver" || ! is_running "containerd"; then
+        echo "Essential Kubernetes components are not running."
+        echo "Please run 'sh setup.sh start' first."
+        echo ""
+        echo "Current status:"
+        echo "  etcd:              $(is_running 'etcd' && echo 'Running' || echo 'Not running')"
+        echo "  kube-apiserver:    $(is_running 'kube-apiserver' && echo 'Running' || echo 'Not running')"
+        echo "  containerd:        $(is_running 'containerd' && echo 'Running' || echo 'Not running')"
+        return 1
+    fi
+
+    HOST_IP=$(hostname -I | awk '{print $1}')
+
+    # Regenerate manifests to ensure they're up to date
+    generate_manifests "$HOST_IP"
+
+    echo "Note: This will transition control plane components to static pods managed by kubelet"
+    echo ""
+
+    # First, stop secondary control plane components
+    echo "Step 1: Stopping kube-controller-manager and kube-scheduler..."
+    stop_process "kube-controller-manager"
+    stop_process "kube-scheduler"
+    sleep 2
+
+    # Start kubelet if not running - it needs API server to be up
+    if ! is_running "kubelet"; then
+        echo "Step 2: Starting kubelet (API server still running as binary)..."
+        sudo PATH=$PATH:/opt/cni/bin:/usr/sbin kubebuilder/bin/kubelet \
+            --kubeconfig=/var/lib/kubelet/kubeconfig \
+            --config=/var/lib/kubelet/config.yaml \
+            --root-dir=/var/lib/kubelet \
+            --cert-dir=/var/lib/kubelet/pki \
+            --tls-cert-file=/var/lib/kubelet/pki/kubelet.crt \
+            --tls-private-key-file=/var/lib/kubelet/pki/kubelet.key \
+            --hostname-override=$(hostname) \
+            --pod-infra-container-image=registry.k8s.io/pause:3.10 \
+            --node-ip=$HOST_IP \
+            --cloud-provider=external \
+            --cgroup-driver=cgroupfs \
+            --max-pods=10  \
+            --v=1 &
+
+        echo "Waiting for kubelet to start and register node..."
+        sleep 10
+
+        # Label and untaint the node
+        NODE_NAME=$(hostname)
+        sudo kubebuilder/bin/kubectl label node "$NODE_NAME" node-role.kubernetes.io/master="" --overwrite 2>/dev/null || true
+        sudo kubebuilder/bin/kubectl taint nodes --all node.cloudprovider.kubernetes.io/uninitialized:NoSchedule- 2>/dev/null || true
+    fi
+
+    echo "Step 3: Waiting for kubelet to detect static pod manifests and start pods..."
+    echo "This may take 20-30 seconds..."
+    sleep 25
+
+    echo "Step 4: Checking if static pods are starting..."
+    sudo kubebuilder/bin/kubectl get pods -n kube-system 2>/dev/null || echo "Pods not visible yet..."
+
+    echo ""
+    echo "Step 5: Now stopping the binary kube-apiserver..."
+    echo "(Static pod kube-apiserver should take over)"
+    stop_process "kube-apiserver"
+
+    echo "Waiting for static pod API server to become ready..."
+    sleep 15
+
+    echo ""
+    echo "=== Verification ==="
+    echo "Static pods:"
+    sudo kubebuilder/bin/kubectl get pods -n kube-system -o wide 2>/dev/null || echo "Note: API server may still be starting..."
+
+    echo ""
+    echo "Node status:"
+    sudo kubebuilder/bin/kubectl get nodes 2>/dev/null || echo "Waiting for API server..."
+
+    echo ""
+    echo "Static pod manifests location: /etc/kubernetes/manifests/"
+    echo "Kubelet will automatically manage these pods."
+    echo ""
+    echo "To monitor: watch 'sudo kubebuilder/bin/kubectl get pods -n kube-system'"
 }
 
 stop() {
@@ -390,7 +506,7 @@ cleanup() {
     # Clean up other directories
     sudo rm -rf ./etcd
     sudo rm -rf /run/containerd/*
-    sudo rm -f /tmp/sa.key /tmp/sa.pub /tmp/token.csv /tmp/ca.key /tmp/ca.crt
+    sudo rm -rf /etc/kubernetes/pki/*
 
     echo "Cleanup complete"
 }
@@ -399,6 +515,9 @@ case "${1:-}" in
     start)
         start
         ;;
+    start-static)
+        start_static
+        ;;
     stop)
         stop
         ;;
@@ -406,7 +525,13 @@ case "${1:-}" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {start|stop|cleanup}"
+        echo "Usage: $0 {start|start-static|stop|cleanup}"
+        echo ""
+        echo "Commands:"
+        echo "  start         - Start Kubernetes with binary-based control plane"
+        echo "  start-static  - Transition control plane to kubelet-managed static pods"
+        echo "  stop          - Stop all Kubernetes components"
+        echo "  cleanup       - Stop and clean up all data"
         exit 1
         ;;
 esac
