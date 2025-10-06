@@ -377,39 +377,88 @@ start() {
 start_static() {
     echo "Transitioning control plane to static pods..."
     
-    if ! check_running; then
-        echo "Kubernetes components are not running. Please run 'sh setup.sh start' first."
+    # Check if essential components are running (not cloud-controller-manager or kubelet yet)
+    if ! is_running "etcd" || ! is_running "kube-apiserver"; then
+        echo "Essential Kubernetes components are not running."
+        echo "Please run 'sh setup.sh start' first."
+        echo ""
+        echo "Current status:"
+        echo "  etcd:              $(is_running 'etcd' && echo 'Running' || echo 'Not running')"
+        echo "  kube-apiserver:    $(is_running 'kube-apiserver' && echo 'Running' || echo 'Not running')"
+        echo "  containerd:        $(is_running 'containerd' && echo 'Running' || echo 'Not running')"
         return 1
     fi
-    
+
     HOST_IP=$(hostname -I | awk '{print $1}')
-    
+
     # Regenerate manifests to ensure they're up to date
     generate_manifests "$HOST_IP"
-    
-    echo "Stopping binary-based control plane components..."
-    echo "Note: etcd, containerd, and kubelet will continue running"
-    
-    # Stop only the control plane components (not etcd, containerd, or kubelet)
+
+    echo "Note: This will transition control plane components to static pods managed by kubelet"
+    echo ""
+
+    # First, stop secondary control plane components
+    echo "Step 1: Stopping kube-controller-manager and kube-scheduler..."
     stop_process "kube-controller-manager"
     stop_process "kube-scheduler"
-    stop_process "kube-apiserver"
-    
-    echo "Waiting for kubelet to detect and start static pods..."
+    sleep 2
+
+    # Start kubelet if not running - it needs API server to be up
+    if ! is_running "kubelet"; then
+        echo "Step 2: Starting kubelet (API server still running as binary)..."
+        sudo PATH=$PATH:/opt/cni/bin:/usr/sbin kubebuilder/bin/kubelet \
+            --kubeconfig=/var/lib/kubelet/kubeconfig \
+            --config=/var/lib/kubelet/config.yaml \
+            --root-dir=/var/lib/kubelet \
+            --cert-dir=/var/lib/kubelet/pki \
+            --tls-cert-file=/var/lib/kubelet/pki/kubelet.crt \
+            --tls-private-key-file=/var/lib/kubelet/pki/kubelet.key \
+            --hostname-override=$(hostname) \
+            --pod-infra-container-image=registry.k8s.io/pause:3.10 \
+            --node-ip=$HOST_IP \
+            --cloud-provider=external \
+            --cgroup-driver=cgroupfs \
+            --max-pods=10  \
+            --v=1 &
+
+        echo "Waiting for kubelet to start and register node..."
+        sleep 10
+
+        # Label and untaint the node
+        NODE_NAME=$(hostname)
+        sudo kubebuilder/bin/kubectl label node "$NODE_NAME" node-role.kubernetes.io/master="" --overwrite 2>/dev/null || true
+        sudo kubebuilder/bin/kubectl taint nodes --all node.cloudprovider.kubernetes.io/uninitialized:NoSchedule- 2>/dev/null || true
+    fi
+
+    echo "Step 3: Waiting for kubelet to detect static pod manifests and start pods..."
     echo "This may take 20-30 seconds..."
     sleep 25
+
+    echo "Step 4: Checking if static pods are starting..."
+    sudo kubebuilder/bin/kubectl get pods -n kube-system 2>/dev/null || echo "Pods not visible yet..."
+
+    echo ""
+    echo "Step 5: Now stopping the binary kube-apiserver..."
+    echo "(Static pod kube-apiserver should take over)"
+    stop_process "kube-apiserver"
     
-    echo "Checking static pod status..."
-    sudo kubebuilder/bin/kubectl get pods -n kube-system -o wide
+    echo "Waiting for static pod API server to become ready..."
+    sleep 15
+
+    echo ""
+    echo "=== Verification ==="
+    echo "Static pods:"
+    sudo kubebuilder/bin/kubectl get pods -n kube-system -o wide 2>/dev/null || echo "Note: API server may still be starting..."
     
     echo ""
-    echo "Verifying control plane health..."
-    sudo kubebuilder/bin/kubectl get nodes
-    sudo kubebuilder/bin/kubectl get componentstatuses 2>/dev/null || true
-    
+    echo "Node status:"
+    sudo kubebuilder/bin/kubectl get nodes 2>/dev/null || echo "Waiting for API server..."
+
     echo ""
-    echo "Static pod manifests are located in: /etc/kubernetes/manifests/"
+    echo "Static pod manifests location: /etc/kubernetes/manifests/"
     echo "Kubelet will automatically manage these pods."
+    echo ""
+    echo "To monitor: watch 'sudo kubebuilder/bin/kubectl get pods -n kube-system'"
 }
 
 stop() {
