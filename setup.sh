@@ -317,6 +317,12 @@ start() {
     sudo kubebuilder/bin/kubectl create configmap kube-root-ca.crt --from-file=ca.crt=/etc/kubernetes/pki/ca.crt -n default 2>/dev/null || true
 
 
+    # Wait for containerd to be ready before starting kubelet
+    if is_running "containerd"; then
+        echo "Waiting for containerd to be fully ready..."
+        sleep 3
+    fi
+
     if ! is_running "kubelet"; then
         echo "Starting kubelet..."
         sudo PATH=$PATH:/opt/cni/bin:/usr/sbin kubebuilder/bin/kubelet \
@@ -376,9 +382,9 @@ start() {
 
 start_static() {
     echo "Transitioning control plane to static pods..."
-    
+
     # Check if essential components are running (not cloud-controller-manager or kubelet yet)
-    if ! is_running "etcd" || ! is_running "kube-apiserver"; then
+    if ! is_running "etcd" || ! is_running "kube-apiserver" || ! is_running "containerd"; then
         echo "Essential Kubernetes components are not running."
         echo "Please run 'sh setup.sh start' first."
         echo ""
@@ -441,7 +447,7 @@ start_static() {
     echo "Step 5: Now stopping the binary kube-apiserver..."
     echo "(Static pod kube-apiserver should take over)"
     stop_process "kube-apiserver"
-    
+
     echo "Waiting for static pod API server to become ready..."
     sleep 15
 
@@ -449,7 +455,7 @@ start_static() {
     echo "=== Verification ==="
     echo "Static pods:"
     sudo kubebuilder/bin/kubectl get pods -n kube-system -o wide 2>/dev/null || echo "Note: API server may still be starting..."
-    
+
     echo ""
     echo "Node status:"
     sudo kubebuilder/bin/kubectl get nodes 2>/dev/null || echo "Waiting for API server..."
