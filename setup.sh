@@ -60,7 +60,7 @@ download_components() {
     # Install CNI components if not present
     if [ ! -d "/opt/cni" ]; then
         sudo mkdir -p /opt/cni
-        
+
         echo "Installing containerd..."
         wget https://github.com/containerd/containerd/releases/download/v2.0.5/containerd-static-2.0.5-linux-amd64.tar.gz -O /tmp/containerd.tar.gz
         sudo tar zxf /tmp/containerd.tar.gz -C /opt/cni/
@@ -113,7 +113,7 @@ setup_configs() {
     if ! sudo kubebuilder/bin/kubectl config current-context | grep -q "test-context"; then
         sudo kubebuilder/bin/kubectl config set-credentials test-user --token=1234567890
         sudo kubebuilder/bin/kubectl config set-cluster test-env --server=https://127.0.0.1:6443 --insecure-skip-tls-verify
-        sudo kubebuilder/bin/kubectl config set-context test-context --cluster=test-env --user=test-user --namespace=default 
+        sudo kubebuilder/bin/kubectl config set-context test-context --cluster=test-env --user=test-user --namespace=default
         sudo kubebuilder/bin/kubectl config use-context test-context
     fi
 
@@ -225,10 +225,10 @@ start() {
     fi
 
     HOST_IP=$(hostname -I | awk '{print $1}')
-    
+
     # Download components if needed
     download_components
-    
+
     # Setup configurations
     setup_configs
 
@@ -312,9 +312,20 @@ start() {
             --v=1 &
     fi
 
+    # Wait for node to be registered and ready
+    echo "Waiting for node registration..."
+    sleep 5
+
     # Label the node so static pods with nodeSelector can be scheduled
     NODE_NAME=$(hostname)
     sudo kubebuilder/bin/kubectl label node "$NODE_NAME" node-role.kubernetes.io/master="" --overwrite || true
+
+    # Remove cloud provider taint to allow pod scheduling
+    # When using --cloud-provider=external, Kubernetes adds a taint that prevents scheduling
+    # until a cloud controller initializes the node. Since we don't have a real cloud provider,
+    # we need to remove this taint manually.
+    echo "Removing cloud provider taint..."
+    sudo kubebuilder/bin/kubectl taint nodes --all node.cloudprovider.kubernetes.io/uninitialized:NoSchedule- 2>/dev/null || true
 
     if ! is_running "kube-controller-manager"; then
         echo "Starting kube-controller-manager..."
@@ -356,10 +367,31 @@ stop() {
 cleanup() {
     stop
     echo "Cleaning up..."
+
+    # Force unmount any busy projected volumes
+    echo "Unmounting projected volumes..."
+    sudo umount -l /var/lib/kubelet/pods/*/volumes/kubernetes.io~projected/* 2>/dev/null || true
+    sleep 1
+
+    # Remove kubelet data (with fallback for busy mounts)
+    echo "Removing kubelet data..."
+    if ! sudo rm -rf /var/lib/kubelet/* 2>/dev/null; then
+        # If removal fails due to busy mounts, clean everything except busy directories
+        echo "Warning: Some volumes are busy, cleaning other directories..."
+        sudo find /var/lib/kubelet -mindepth 1 -maxdepth 1 ! -name "pods" -delete 2>/dev/null || true
+        # Try to clean pod directories that aren't busy
+        for pod_dir in /var/lib/kubelet/pods/*; do
+            if [ -d "$pod_dir" ]; then
+                sudo rm -rf "$pod_dir" 2>/dev/null || echo "Skipping busy mount in $(basename $pod_dir)"
+            fi
+        done
+    fi
+
+    # Clean up other directories
     sudo rm -rf ./etcd
-    sudo rm -rf /var/lib/kubelet/*
     sudo rm -rf /run/containerd/*
     sudo rm -f /tmp/sa.key /tmp/sa.pub /tmp/token.csv /tmp/ca.key /tmp/ca.crt
+
     echo "Cleanup complete"
 }
 
@@ -377,4 +409,4 @@ case "${1:-}" in
         echo "Usage: $0 {start|stop|cleanup}"
         exit 1
         ;;
-esac 
+esac
